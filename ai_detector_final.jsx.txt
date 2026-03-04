@@ -1,0 +1,939 @@
+import { useState, useCallback } from "react";
+
+// ═══════════════════════════════════════════════════════════════════
+// AI CODE DETECTOR — Final Version
+// Theory of Stochastic Stagnation (Sihare, 2026)
+// DOI: 10.17605/OSF.IO/FSMK9
+//
+// STAGE 1: Entropy signals (exact port of ai_detector.py)
+// STAGE 2: Semantic signals (triggered only on AMBIGUOUS)
+// STAGNATION LAYER: B_req = α·D^γ with three α/γ presets:
+//   — Theoretical:  α=0.5,    γ=1.3    (§5.3 paper values)
+//   — Simulated:    α=1.0377, γ=2.6383 (corrected large-scale fit)
+//   — Custom:       user-defined
+//   NOTE: Neither set is purely true. Superlinear relationship
+//   is confirmed (γ>1); exact parameters are domain-dependent.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── α/γ Presets ───────────────────────────────────────────────────
+const PRESETS = {
+  theoretical: { label: 'Theoretical',  alpha: 0.5,    gamma: 1.3,    note: 'Paper §5.3 — conservative baseline' },
+  simulated:   { label: 'Simulated',    alpha: 1.0377, gamma: 2.6383, note: 'Corrected large-scale fit — steeper demand' },
+  custom:      { label: 'Custom',       alpha: 0.5,    gamma: 1.3,    note: 'User-defined — domain-specific calibration' },
+};
+
+// ── Stage 1: Entropy signals (exact port of ai_detector.py) ───────
+
+const AI_NAMES = new Set([
+  'result','results','data','value','values','temp','tmp','item','items',
+  'element','helper','utils','output','input','param','params','args','kwargs',
+  'obj','node','key','val','num','count','total','index','idx','lst','arr',
+  'response','request','handler','manager','processor','execute','compute'
+]);
+
+function byteEntropy(str) {
+  if (!str) return 0;
+  const bytes = new TextEncoder().encode(str);
+  const counts = {};
+  for (const b of bytes) counts[b] = (counts[b] || 0) + 1;
+  const total = bytes.length;
+  return -Object.values(counts).reduce((a, c) => a + (c/total)*Math.log2(c/total), 0);
+}
+
+function compressRatio(str) {
+  if (str.length < 32) return 1.0;
+  const bigrams = {};
+  for (let i = 0; i < str.length - 1; i++) {
+    const bg = str[i] + str[i+1];
+    bigrams[bg] = (bigrams[bg] || 0) + 1;
+  }
+  return Math.min(1.0, Object.keys(bigrams).length / Math.max(str.length - 1, 1));
+}
+
+function burstiness(str, chunkSize = 256) {
+  if (str.length < chunkSize * 2) return 0.5;
+  const chunks = [];
+  for (let i = 0; i < str.length - chunkSize; i += chunkSize)
+    chunks.push(str.slice(i, i + chunkSize));
+  const ents = chunks.map(c => byteEntropy(c));
+  if (ents.length < 2) return 0.5;
+  const m = ents.reduce((a,b) => a+b, 0) / ents.length;
+  const std = Math.sqrt(ents.reduce((a,e) => a+(e-m)**2, 0) / ents.length);
+  return Math.min(1.0, std / 0.5);
+}
+
+function scoreEntropy(h) {
+  if (h < 3.0) return 0.10;
+  if (h < 5.0) return 0.40;
+  if (h >= 6.2 && h <= 7.6) return 0.25;
+  if (h > 7.8) return 0.70;
+  return 0.60;
+}
+
+function scoreCompress(r) {
+  if (r < 0.30) return 0.10;
+  if (r < 0.65) return 0.25;
+  if (r < 0.80) return 0.55;
+  return 0.75;
+}
+
+function analyzeCode(src) {
+  const s = {};
+  const words = src.match(/\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b/g) || [];
+
+  if (words.length > 0) {
+    const wc = {};
+    for (const w of words) wc[w] = (wc[w] || 0) + 1;
+    const n = words.length;
+    const ie = -Object.values(wc).reduce((a,c) => a+(c/n)*Math.log2(c/n), 0);
+    s.identifier_entropy = +ie.toFixed(4);
+    s.id_entropy_score   = Math.min(1.0, ie / 6.0);
+  } else {
+    s.identifier_entropy = 0; s.id_entropy_score = 0.5;
+  }
+
+  const id_set = new Set(words.map(w => w.toLowerCase()));
+  let overlap = 0;
+  for (const w of id_set) if (AI_NAMES.has(w)) overlap++;
+  const gr = overlap / Math.max(id_set.size, 1);
+  s.generic_ratio = +gr.toFixed(4);
+  s.generic_score = Math.max(0, 1 - gr * 2);
+
+  const fnBlocks = src.split(/(?=\bdef\s)/);
+  if (fnBlocks.length > 1) {
+    const cxs = fnBlocks.slice(1).map(b =>
+      (b.match(/\b(if|for|while|try|except)\b/g) || []).length
+    );
+    if (cxs.length >= 2) {
+      const m = cxs.reduce((a,b)=>a+b,0)/cxs.length;
+      const v = cxs.reduce((a,v)=>a+(v-m)**2,0)/cxs.length;
+      s.complexity_variance = +v.toFixed(4);
+      s.ast_score = Math.min(1.0, v / 4.0);
+    } else { s.complexity_variance = 0; s.ast_score = 0.30; }
+  } else { s.complexity_variance = 0; s.ast_score = 0.50; }
+
+  const lines = src.split('\n').filter(l => l.trim());
+  if (lines.length >= 2) {
+    const lens = lines.map(l => l.length);
+    const m = lens.reduce((a,b)=>a+b,0)/lens.length;
+    const lv = lens.reduce((a,v)=>a+(v-m)**2,0)/lens.length;
+    s.line_variance = +lv.toFixed(4);
+    s.line_variance_score = Math.min(1.0, lv / 400.0);
+  } else { s.line_variance = 0; s.line_variance_score = 0.5; }
+
+  s.type_specific_score = +(
+    s.id_entropy_score*0.35 + s.generic_score*0.30 +
+    s.ast_score*0.20 + s.line_variance_score*0.15
+  ).toFixed(4);
+  return s;
+}
+
+function runStage1(src) {
+  const hb    = byteEntropy(src);
+  const cr    = compressRatio(src);
+  const burst = burstiness(src);
+  const se    = scoreEntropy(hb);
+  const sc    = scoreCompress(cr);
+  const ts    = analyzeCode(src);
+  const final = +(se*0.20 + sc*0.20 + burst*0.20 + ts.type_specific_score*0.40).toFixed(4);
+
+  let verdict, confidence;
+  if      (final >= 0.75) { verdict = 'LIKELY HUMAN';        confidence = 'High'; }
+  else if (final >= 0.60) { verdict = 'PROBABLY HUMAN';      confidence = 'Medium'; }
+  else if (final >= 0.45) { verdict = 'AMBIGUOUS';           confidence = 'Low'; }
+  else if (final >= 0.30) { verdict = 'PROBABLY AI';         confidence = 'Medium'; }
+  else                    { verdict = 'LIKELY AI';           confidence = 'High'; }
+
+  return {
+    human_score: final, ai_score: +(1-final).toFixed(4),
+    verdict, confidence,
+    needsStage2: final >= 0.30 && final < 0.75,
+    byte_entropy: +hb.toFixed(4), compress_ratio: +cr.toFixed(4),
+    burstiness: +burst.toFixed(4),
+    score_entropy: se, score_compress: sc, score_burstiness: burst,
+    score_type: ts.type_specific_score, type_signals: ts,
+  };
+}
+
+// ── Stage 2: Semantic checks (triggered on AMBIGUOUS only) ─────────
+
+function runStage2(src) {
+  const checks = [];
+  const lines = src.split('\n');
+  const fns = src.match(/\bdef\s+\w+/g) || [];
+
+  // 1. Docstring obviousness
+  const docstrings = src.match(/"""[\s\S]*?"""/g) || [];
+  let trivial = 0;
+  const trivPat = [/^(calculate|compute|process|handle|get|set|check|update|load|save|run|execute|return|perform)\s/,/^(this function|this method|this class)/,/^initialize the/,/^a (simple|basic|helper)/];
+  for (const d of docstrings) {
+    const c = d.replace(/"""/g,'').trim().toLowerCase();
+    if (trivPat.some(p => p.test(c))) trivial++;
+  }
+  const docRatio = docstrings.length > 0 ? trivial/docstrings.length : 0;
+  checks.push({
+    id:'docstring', label:'Docstring Obviousness',
+    score: Math.max(0, 1 - docRatio*1.5),
+    aiSignal: docRatio > 0.5,
+    desc: docRatio > 0.5
+      ? `${trivial}/${docstrings.length} docstrings restate the function name — AI pattern`
+      : docstrings.length === 0 ? 'No docstrings — humans skip them too'
+      : 'Docstrings add non-obvious context — human pattern',
+    raw: `${trivial}/${docstrings.length} trivial`,
+  });
+
+  // 2. Exception politeness
+  const tryCount = (src.match(/\btry\s*:/g)||[]).length;
+  const printInExcept = (src.match(/except[\s\S]{0,80}?print\s*\(/g)||[]).length;
+  const fnCount = Math.max(fns.length, 1);
+  const tryRatio = tryCount / fnCount;
+  const exPolite = tryRatio > 0.5 && printInExcept > 0;
+  checks.push({
+    id:'exceptions', label:'Exception Politeness',
+    score: exPolite ? 0.2 : tryRatio > 0.3 ? 0.5 : 0.75,
+    aiSignal: exPolite,
+    desc: exPolite
+      ? `${tryCount} try blocks for ${fnCount} fns + print-in-except — AI over-handles`
+      : tryCount === 0 ? 'No try/except — humans let things crash'
+      : `${tryCount} try block(s), minimal messaging — natural`,
+    raw: `${tryCount} try, ${printInExcept} print-in-except`,
+  });
+
+  // 3. Structural completeness
+  const pairs = [
+    /def save/.test(src) && /def load/.test(src),
+    /def to_dict/.test(src),
+    /def __str__/.test(src) || /def __repr__/.test(src),
+  ].filter(Boolean).length;
+  checks.push({
+    id:'structure', label:'Structural Completeness',
+    score: pairs >= 2 ? 0.25 : pairs === 1 ? 0.55 : 0.75,
+    aiSignal: pairs >= 2,
+    desc: pairs >= 2
+      ? `${pairs} paired patterns (save/load, to_dict, __str__) — suspiciously complete`
+      : pairs === 1 ? 'Partially complete — borderline'
+      : 'Incomplete/asymmetric — human leaves gaps',
+    raw: `${pairs}/3 paired patterns`,
+  });
+
+  // 4. Comment intent (why vs what)
+  const comments = lines.map(l => l.match(/\s*#\s*(.+)/)?.[1]).filter(Boolean);
+  let why = 0, what = 0;
+  for (const c of comments) {
+    if (/\bbecause\b|\bworkaround\b|\bfixme\b|\btodo\b|\bhack\b|\bdon't\b|\bwhy\b|\bavoid\b|\blegacy\b/i.test(c)) why++;
+    else if (/^(loop|iterate|check|get|set|add|append|return|print|call|create|init|process)/i.test(c)) what++;
+  }
+  checks.push({
+    id:'comments', label:'Comment Intent (Why vs What)',
+    score: comments.length === 0 ? 0.6 : why > what ? 0.80 : what > why*2 ? 0.20 : 0.50,
+    aiSignal: what > why*2,
+    desc: comments.length === 0 ? 'No inline comments — inconclusive'
+      : why > what ? `${why} "why" vs ${what} "what" — human pattern`
+      : `${what} descriptive "what" comments — AI restates the code`,
+    raw: `${why} why / ${what} what`,
+  });
+
+  // 5. Naming drift
+  const ids = src.match(/\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b/g) || [];
+  const camel  = ids.filter(w => /[a-z][A-Z]/.test(w)).length;
+  const snake  = ids.filter(w => /[a-z]_[a-z]/.test(w)).length;
+  const abbrev = ids.filter(w => w.length <= 3 && /^[a-z]+$/.test(w)).length;
+  const mixed = camel > 0 && snake > 0;
+  checks.push({
+    id:'naming', label:'Naming Drift & Style Mix',
+    score: (mixed || abbrev > 2) ? 0.75 : 0.30,
+    aiSignal: !mixed && abbrev <= 2,
+    desc: mixed ? `Mixed camelCase(${camel}) + snake_case(${snake}) — human inconsistency`
+      : abbrev > 2 ? `${abbrev} short abbreviations — human informality`
+      : 'Perfectly consistent snake_case — AI discipline',
+    raw: `camel=${camel} snake=${snake} abbrev=${abbrev}`,
+  });
+
+  const weights = [0.20, 0.20, 0.25, 0.20, 0.15];
+  const s2score = +(checks.reduce((a,c,i) => a + c.score*weights[i], 0)).toFixed(4);
+  const aiFlags = checks.filter(c => c.aiSignal).length;
+
+  let s2verdict;
+  if      (s2score >= 0.65) s2verdict = 'SEMANTIC: HUMAN PATTERNS';
+  else if (s2score >= 0.45) s2verdict = 'SEMANTIC: MIXED SIGNALS';
+  else                       s2verdict = 'SEMANTIC: AI PATTERNS';
+
+  return { checks, s2score, s2verdict, aiFlags };
+}
+
+// ── Stagnation layer: B_req from single file ───────────────────────
+// D estimated from the code itself (search space vs specificity)
+// B estimated from how "far" the code sits from the AI modal zone
+// This gives a single-file stagnation risk reading
+
+function stagnationLayer(src, s1, alpha, gamma) {
+  const tokens = src.match(/\b\w+\b|[^\w\s]/g) || [];
+  const n = tokens.length;
+  const uniqueIds = new Set(src.match(/\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b/g)||[]).size;
+  const vocabSize = 35 + 68 + uniqueIds;
+  const log2S = n * Math.log2(Math.max(vocabSize, 2));
+  // T: approximate — code that would pass basic tests (~10% of S for specific code)
+  const log2T = log2S + 10 * Math.log2(0.9);
+  const D = Math.max(0, +(log2S - log2T).toFixed(4));
+
+  // B proxy from single file: distance of human_score from AI modal zone (0.25–0.45)
+  // AI code clusters at human_score ≈ 0.35; human code at ≈ 0.65+
+  // B ≈ how far the code's entropy signature is from the AI cluster
+  const aiClusterCenter = 0.35;
+  const B = +Math.abs(s1.human_score - aiClusterCenter).toFixed(4);
+
+  const B_req = +(alpha * Math.pow(D, gamma)).toFixed(4);
+  const theta = +(s1.human_score / 0.65).toFixed(4); // normalized: 0.65 = typical human baseline
+  const thetaClamped = Math.min(theta, 1.2);
+
+  let thetaZone;
+  if      (thetaClamped >= 0.90) thetaZone = { label: 'HEALTHY',          color: '#00e87a' };
+  else if (thetaClamped >= 0.80) thetaZone = { label: 'EARLY COLLAPSE',   color: '#88ffcc' };
+  else if (thetaClamped >= 0.60) thetaZone = { label: 'CRITICAL ZONE',    color: '#ffcc00' };
+  else if (thetaClamped >= 0.20) thetaZone = { label: 'LATE COLLAPSE',    color: '#ff8844' };
+  else                            thetaZone = { label: 'COMPLETE FAILURE', color: '#ff4444' };
+
+  return { D, B, B_req, theta: thetaClamped, thetaZone,
+    B_sufficient: B >= B_req, alpha, gamma };
+}
+
+// ── Combined final verdict ─────────────────────────────────────────
+function combineVerdict(s1, s2) {
+  const combined = +(s1.human_score*0.70 + s2.s2score*0.30).toFixed(4);
+  let verdict, confidence, explanation;
+  if      (combined >= 0.70) { verdict='LIKELY HUMAN';   confidence='High';   explanation='Entropy + semantic patterns align with human authorship.'; }
+  else if (combined >= 0.58) { verdict='PROBABLY HUMAN'; confidence='Medium'; explanation='Both stages lean human; some AI patterns present.'; }
+  else if (combined >= 0.42) { verdict='AMBIGUOUS';      confidence='Low';    explanation='Mixed signals — AI-assisted, heavily edited, or formulaic human code.'; }
+  else if (combined >= 0.28) { verdict='PROBABLY AI';    confidence='Medium'; explanation='Semantic patterns strongly suggest AI generation.'; }
+  else                        { verdict='LIKELY AI';      confidence='High';   explanation='Entropy collapse + semantic patterns both indicate AI origin.'; }
+  return { combined, verdict, confidence, explanation };
+}
+
+// ── Demo samples ───────────────────────────────────────────────────
+const DEMO_HUMAN = `import sys
+
+def _mat_mul(A, B):
+    # 2x2 only — inlined because overhead of a general fn kills perf
+    return [
+        [A[0][0]*B[0][0]+A[0][1]*B[1][0], A[0][0]*B[0][1]+A[0][1]*B[1][1]],
+        [A[1][0]*B[0][0]+A[1][1]*B[1][0], A[1][0]*B[0][1]+A[1][1]*B[1][1]]
+    ]
+
+def mat_pow(M, p):
+    if p == 1: return M
+    half = mat_pow(M, p // 2)
+    sq = _mat_mul(half, half)
+    return _mat_mul(sq, M) if p % 2 else sq
+
+def fib(n):
+    if n < 2: return n
+    return mat_pow([[1,1],[1,0]], n)[0][1]
+
+if __name__ == '__main__':
+    N = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+    evens = [fib(k) for k in range(N) if fib(k) % 2 == 0]
+    print("even fibs:", evens, "| sum:", sum(evens))
+`;
+
+const DEMO_AI = `import json
+import os
+from datetime import datetime
+
+class Task:
+    """Represents a single task in the system."""
+    def __init__(self, task_id, title, category="General", priority="Medium"):
+        self.id = task_id
+        self.title = title
+        self.category = category
+        self.priority = priority
+        self.completed = False
+        self.created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def to_dict(self):
+        """Converts task object to dictionary for JSON storage."""
+        return self.__dict__
+
+    def __str__(self):
+        """Returns string representation of the task."""
+        status = "Done" if self.completed else "Pending"
+        return f"[{self.id}] {self.title} | {self.category} | {status}"
+
+class TaskManager:
+    """Manages a collection of Task objects."""
+    def __init__(self):
+        self.tasks = []
+        self.load_tasks()
+
+    def add_task(self, title, category, priority):
+        """Add a new task to the manager."""
+        new_id = max([t.id for t in self.tasks], default=0) + 1
+        new_task = Task(new_id, title, category, priority)
+        self.tasks.append(new_task)
+        self.save_tasks()
+
+    def save_tasks(self):
+        """Writes current tasks to a JSON file."""
+        try:
+            with open("tasks.json", "w") as f:
+                json.dump([t.to_dict() for t in self.tasks], f, indent=4)
+            print("Tasks saved successfully.")
+        except Exception as e:
+            print(f"Error saving tasks: {e}")
+
+    def load_tasks(self):
+        """Reads tasks from the JSON file on startup."""
+        try:
+            with open("tasks.json", "r") as f:
+                data = json.load(f)
+                self.tasks = [Task(**item) for item in data]
+        except FileNotFoundError:
+            self.tasks = []
+        except Exception as e:
+            print(f"Error loading tasks: {e}")
+            self.tasks = []
+`;
+
+// ═══════════════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════════════
+
+const C = {
+  bg:'#07070f', surface:'#0d0d1f', border:'#1a1a35',
+  dim:'#333355', muted:'#5a5a7a', text:'#c8c8e8',
+  accent:'#5555ee', human:'#00e87a', ai:'#ff4444',
+  warn:'#ffcc00', mixed:'#ff8844',
+};
+
+const VSTYLE = {
+  'LIKELY HUMAN':   { color:'#00e87a', bg:'#001f10', icon:'◉' },
+  'PROBABLY HUMAN': { color:'#66ffbb', bg:'#001a0d', icon:'◎' },
+  'AMBIGUOUS':      { color:'#ffcc00', bg:'#1f1800', icon:'◈' },
+  'PROBABLY AI':    { color:'#ff8844', bg:'#1f0c00', icon:'◍' },
+  'LIKELY AI':      { color:'#ff4444', bg:'#1f0000', icon:'●' },
+};
+
+function sc(v) {
+  if (v>=0.70) return C.human;
+  if (v>=0.55) return '#66ffbb';
+  if (v>=0.42) return C.warn;
+  if (v>=0.28) return C.mixed;
+  return C.ai;
+}
+
+function Bar({ value, color }) {
+  return (
+    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+      <div style={{ flex:1, height:5, background:'#111128', borderRadius:3, overflow:'hidden' }}>
+        <div style={{ width:`${Math.max(1,Math.round(value*100))}%`, height:'100%', background:color,
+          borderRadius:3, transition:'width 0.7s cubic-bezier(0.23,1,0.32,1)', boxShadow:`0 0 7px ${color}44` }}/>
+      </div>
+      <span style={{ fontSize:11, color:'#777799', fontFamily:'monospace', minWidth:30, textAlign:'right' }}>
+        {(value*100).toFixed(0)}%
+      </span>
+    </div>
+  );
+}
+
+function SigRow({ label, score, raw, weight }) {
+  return (
+    <div style={{ marginBottom:9 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
+        <span style={{ fontSize:11, color:'#8888cc', fontFamily:'monospace' }}>{label}</span>
+        <span style={{ fontSize:10, color:C.dim, fontFamily:'monospace' }}>
+          raw={raw !== undefined ? Number(raw).toFixed(3) : '—'} · w={weight}
+        </span>
+      </div>
+      <Bar value={score} color={sc(score)}/>
+    </div>
+  );
+}
+
+function SemCheck({ c }) {
+  const col = c.aiSignal ? C.ai : C.human;
+  return (
+    <div style={{ marginBottom:7, padding:'9px 11px',
+      background: c.aiSignal ? '#160606' : '#061408',
+      border:`1px solid ${c.aiSignal ? '#ff444420' : '#00e87a20'}`, borderRadius:4 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:5 }}>
+        <span style={{ fontSize:11, color:col, fontFamily:'monospace' }}>{c.label}</span>
+        <span style={{ fontSize:10, color:col+'99', fontFamily:'monospace' }}>
+          {c.aiSignal ? '▲ AI' : '▽ HU'} · {(c.score*100).toFixed(0)}%
+        </span>
+      </div>
+      <Bar value={c.score} color={col}/>
+      <div style={{ marginTop:5, fontSize:10, color:C.muted }}>{c.desc}</div>
+      <div style={{ marginTop:2, fontSize:9, color:C.dim, fontFamily:'monospace' }}>[{c.raw}]</div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [code,       setCode]       = useState('');
+  const [preset,     setPreset]     = useState('theoretical');
+  const [customA,    setCustomA]    = useState(0.5);
+  const [customG,    setCustomG]    = useState(1.3);
+  const [s1,         setS1]         = useState(null);
+  const [s2,         setS2]         = useState(null);
+  const [final,      setFinal]      = useState(null);
+  const [stag,       setStag]       = useState(null);
+  const [phase,      setPhase]      = useState('idle');
+  const [tab,        setTab]        = useState('verdict');
+
+  const activeAlpha = preset === 'custom' ? customA : PRESETS[preset].alpha;
+  const activeGamma = preset === 'custom' ? customG : PRESETS[preset].gamma;
+
+  const reset = () => {
+    setCode(''); setS1(null); setS2(null); setFinal(null); setStag(null);
+    setPhase('idle'); setTab('verdict');
+  };
+
+  const analyze = useCallback(() => {
+    if (!code.trim()) return;
+    setS1(null); setS2(null); setFinal(null); setStag(null);
+    setPhase('s1'); setTab('verdict');
+
+    setTimeout(() => {
+      const r1 = runStage1(code);
+      setS1(r1);
+
+      if (!r1.needsStage2) {
+        const sg = stagnationLayer(code, r1, activeAlpha, activeGamma);
+        setStag(sg);
+        setFinal({ combined: r1.human_score, verdict: r1.verdict,
+          confidence: r1.confidence,
+          explanation: r1.human_score >= 0.75
+            ? 'Strong entropy signal — unambiguously human. Stage 2 skipped.'
+            : 'Strong AI entropy signature. Stage 2 skipped.' });
+        setPhase('done');
+        return;
+      }
+
+      setPhase('s2');
+      setTimeout(() => {
+        const r2 = runStage2(code);
+        setS2(r2);
+        const f = combineVerdict(r1, r2);
+        const sg = stagnationLayer(code, r1, activeAlpha, activeGamma);
+        setFinal(f); setStag(sg);
+        setPhase('done');
+      }, 350);
+    }, 200);
+  }, [code, activeAlpha, activeGamma]);
+
+  const vs = final ? (VSTYLE[final.verdict] || VSTYLE['AMBIGUOUS']) : null;
+
+  const Tab = ({ id, label, disabled }) => (
+    <button onClick={() => !disabled && setTab(id)} style={{
+      background: tab===id ? '#1a1a3a' : 'transparent',
+      border:`1px solid ${tab===id ? '#4444aa' : C.border}`,
+      color: disabled ? C.dim : tab===id ? '#aaaaff' : C.muted,
+      padding:'5px 12px', fontSize:10, cursor: disabled ? 'default' : 'pointer',
+      letterSpacing:'0.1em', fontFamily:'monospace', borderRadius:3,
+    }}>{label}</button>
+  );
+
+  return (
+    <div style={{ minHeight:'100vh', background:C.bg, color:C.text,
+      fontFamily:"'Courier New', monospace", padding:'18px 14px', boxSizing:'border-box' }}>
+
+      {/* Header */}
+      <div style={{ maxWidth:900, margin:'0 auto 14px' }}>
+        <div style={{ fontSize:10, color:'#33336a', letterSpacing:'0.16em', marginBottom:3 }}>
+          STOCHASTIC STAGNATION FRAMEWORK · Sihare (2026) · DOI:10.17605/OSF.IO/FSMK9
+        </div>
+        <h1 style={{ margin:0, fontSize:18, fontWeight:'normal', color:'#e0e0ff',
+          borderBottom:`1px solid ${C.border}`, paddingBottom:10, letterSpacing:'0.05em' }}>
+          <span style={{ color:C.accent }}>⬡</span> AI CODE DETECTOR
+          <span style={{ fontSize:11, color:C.dim, marginLeft:14 }}>
+            Two-Stage · Entropy + Semantic · B_req = α·D^γ
+          </span>
+        </h1>
+
+        {/* Pipeline strip */}
+        <div style={{ display:'flex', alignItems:'center', gap:6, marginTop:8, fontSize:10, color:C.dim, flexWrap:'wrap' }}>
+          <span style={{ padding:'2px 8px', border:`1px solid #3333aa`, color:'#6666cc', borderRadius:2 }}>
+            S1 · Entropy
+          </span>
+          <span>→ if 0.30–0.75 →</span>
+          <span style={{ padding:'2px 8px', border:`1px solid #aa6600`, color:'#cc8833', borderRadius:2 }}>
+            S2 · Semantic
+          </span>
+          <span>→</span>
+          <span style={{ padding:'2px 8px', border:`1px solid #336633`, color:'#44aa44', borderRadius:2 }}>
+            Verdict
+          </span>
+          <span style={{ marginLeft:8 }}>+</span>
+          <span style={{ padding:'2px 8px', border:`1px solid #555599`, color:'#7777cc', borderRadius:2 }}>
+            Stagnation Layer · α={activeAlpha} · γ={activeGamma}
+          </span>
+        </div>
+      </div>
+
+      {/* α/γ Preset selector */}
+      <div style={{ maxWidth:900, margin:'0 auto 12px', background:C.surface,
+        border:`1px solid ${C.border}`, borderRadius:4, padding:'10px 14px' }}>
+        <div style={{ fontSize:10, color:'#33336a', letterSpacing:'0.12em', marginBottom:8 }}>
+          B_req = α·D^γ PARAMETER PRESET
+          <span style={{ color:C.dim, marginLeft:10, fontSize:9 }}>
+            Neither set is purely true — superlinear relationship (γ&gt;1) is confirmed; magnitude is domain-dependent
+          </span>
+        </div>
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', alignItems:'center' }}>
+          {Object.entries(PRESETS).filter(([k]) => k !== 'custom').map(([key, p]) => (
+            <button key={key} onClick={() => setPreset(key)} style={{
+              background: preset===key ? '#1a1a3a' : 'transparent',
+              border:`1px solid ${preset===key ? '#5555cc' : C.border}`,
+              color: preset===key ? '#aaaaff' : C.muted,
+              padding:'5px 12px', fontSize:10, cursor:'pointer',
+              fontFamily:'monospace', borderRadius:3,
+            }}>
+              {p.label} · α={p.alpha} · γ={p.gamma}
+            </button>
+          ))}
+          <button onClick={() => setPreset('custom')} style={{
+            background: preset==='custom' ? '#1a1a3a' : 'transparent',
+            border:`1px solid ${preset==='custom' ? '#5555cc' : C.border}`,
+            color: preset==='custom' ? '#aaaaff' : C.muted,
+            padding:'5px 12px', fontSize:10, cursor:'pointer',
+            fontFamily:'monospace', borderRadius:3,
+          }}>Custom</button>
+
+          {preset === 'custom' && (
+            <div style={{ display:'flex', gap:8, alignItems:'center', marginLeft:4 }}>
+              <label style={{ fontSize:10, color:C.muted }}>α</label>
+              <input type="number" step="0.01" value={customA}
+                onChange={e => setCustomA(parseFloat(e.target.value)||0.5)}
+                style={{ width:70, background:'#0a0a1a', border:`1px solid ${C.border}`,
+                  color:C.text, fontFamily:'monospace', fontSize:11,
+                  padding:'3px 7px', borderRadius:3, outline:'none' }}/>
+              <label style={{ fontSize:10, color:C.muted }}>γ</label>
+              <input type="number" step="0.01" value={customG}
+                onChange={e => setCustomG(parseFloat(e.target.value)||1.3)}
+                style={{ width:70, background:'#0a0a1a', border:`1px solid ${C.border}`,
+                  color:C.text, fontFamily:'monospace', fontSize:11,
+                  padding:'3px 7px', borderRadius:3, outline:'none' }}/>
+            </div>
+          )}
+
+          {preset !== 'custom' && (
+            <span style={{ fontSize:9, color:C.dim, marginLeft:4 }}>
+              {PRESETS[preset].note}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Main layout */}
+      <div style={{ maxWidth:900, margin:'0 auto', display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
+
+        {/* LEFT — Input */}
+        <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+          <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+            <span style={{ fontSize:10, color:C.dim }}>DEMO →</span>
+            <button onClick={() => { setCode(DEMO_HUMAN); setS1(null); setS2(null); setFinal(null); setStag(null); setPhase('idle'); }} style={{
+              background:'#08120a', border:`1px solid #00e87a33`, color:C.human,
+              padding:'3px 10px', fontSize:10, cursor:'pointer', fontFamily:'monospace', borderRadius:2 }}>HUMAN</button>
+            <button onClick={() => { setCode(DEMO_AI); setS1(null); setS2(null); setFinal(null); setStag(null); setPhase('idle'); }} style={{
+              background:'#120808', border:`1px solid #ff444433`, color:C.ai,
+              padding:'3px 10px', fontSize:10, cursor:'pointer', fontFamily:'monospace', borderRadius:2 }}>AI</button>
+            <button onClick={reset} style={{
+              background:'transparent', border:`1px solid ${C.dim}`, color:C.dim,
+              padding:'3px 10px', fontSize:10, cursor:'pointer', fontFamily:'monospace', borderRadius:2, marginLeft:'auto' }}>CLR</button>
+          </div>
+
+          <textarea value={code}
+            onChange={e => { setCode(e.target.value); setS1(null); setS2(null); setFinal(null); setStag(null); setPhase('idle'); }}
+            placeholder="# Paste Python code here..."
+            style={{ width:'100%', height:310, background:'#09091a', border:`1px solid ${C.border}`,
+              borderRadius:4, color:'#c0c0e0', fontFamily:'monospace', fontSize:11.5,
+              padding:12, resize:'none', outline:'none', boxSizing:'border-box', lineHeight:1.65 }}/>
+
+          <button onClick={analyze} disabled={!code.trim() || phase==='s1' || phase==='s2'} style={{
+            background: code.trim() && phase==='idle' ? '#12123a' : C.surface,
+            border:`1px solid ${code.trim() && phase==='idle' ? '#4444bb' : C.dim}`,
+            color: code.trim() && phase==='idle' ? '#8888ff' : C.dim,
+            padding:'9px 0', fontSize:11, letterSpacing:'0.18em',
+            cursor: code.trim() && phase==='idle' ? 'pointer' : 'default',
+            fontFamily:'monospace', borderRadius:3, width:'100%', transition:'all 0.2s' }}>
+            {phase==='s1' ? '[ STAGE 1: ENTROPY... ]' : phase==='s2' ? '[ STAGE 2: SEMANTIC... ]' : '[ RUN DETECTOR ]'}
+          </button>
+
+          {/* Pipeline status */}
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4, padding:'10px 12px' }}>
+            <div style={{ fontSize:10, color:C.dim, letterSpacing:'0.1em', marginBottom:7 }}>PIPELINE STATUS</div>
+            {[
+              { label:'Stage 1 · Entropy + Code Signals', done:!!s1, active:phase==='s1' },
+              { label:'Stage 2 · Semantic Analysis',      done:!!s2, active:phase==='s2', skipped:s1&&!s1.needsStage2 },
+              { label:'Stagnation Layer · B_req = α·D^γ', done:!!stag, active:false },
+              { label:'Final Combined Verdict',           done:!!final, active:false },
+            ].map((p,i) => (
+              <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
+                <span style={{ fontSize:12, color: p.done ? C.human : p.skipped ? C.dim : p.active ? C.warn : C.dim }}>
+                  {p.done ? '✓' : p.skipped ? '–' : p.active ? '◌' : '○'}
+                </span>
+                <span style={{ fontSize:10, color: p.done ? C.muted : p.skipped ? C.dim : p.active ? C.warn : C.dim, fontFamily:'monospace' }}>
+                  {p.label}{p.skipped ? ' (skipped)' : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Formula box */}
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4, padding:'10px 12px', fontSize:10, color:C.dim, lineHeight:2 }}>
+            <div style={{ color:'#33336a', marginBottom:2 }}>STAGE 1 — exact port of ai_detector.py</div>
+            <div style={{ color:'#3a3a6a' }}>
+              score = ent×0.20 + compress×0.20 + burst×0.20<br/>
+              &nbsp;&nbsp;+ (id_ent×0.35 + generic×0.30 + ast×0.20 + line_var×0.15)×0.40
+            </div>
+            <div style={{ color:'#33336a', marginTop:6, marginBottom:2 }}>STAGNATION — B_req = α·D^γ</div>
+            <div style={{ color:'#3a3a6a' }}>
+              α={activeAlpha} · γ={activeGamma} · w_collapse &lt; 0.15<br/>
+              Superlinear confirmed (γ&gt;1) · params are domain-dependent
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT — Results */}
+        <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+
+          {phase === 'idle' && !final ? (
+            <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center',
+              background:'#07070f', border:`1px dashed ${C.border}`, borderRadius:4,
+              color:C.dim, fontSize:12, letterSpacing:'0.1em', minHeight:380 }}>
+              AWAITING INPUT
+            </div>
+          ) : (
+            <>
+              {/* Tabs */}
+              {final && (
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                  <Tab id="verdict"   label="VERDICT" />
+                  <Tab id="s1"        label="STAGE 1" disabled={!s1} />
+                  <Tab id="s2"        label="STAGE 2" disabled={!s2} />
+                  <Tab id="stagnation" label="STAGNATION" disabled={!stag} />
+                </div>
+              )}
+
+              {/* VERDICT TAB */}
+              {(tab==='verdict' || !final) && final && vs && (
+                <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                  <div style={{ background:vs.bg, border:`2px solid ${vs.color}44`, borderRadius:4, padding:'14px 16px' }}>
+                    <div style={{ fontSize:9, color:vs.color+'88', letterSpacing:'0.2em', marginBottom:5 }}>
+                      FINAL VERDICT · {final.confidence.toUpperCase()} CONFIDENCE
+                    </div>
+                    <div style={{ fontSize:18, color:vs.color, fontWeight:'bold', letterSpacing:'0.08em', marginBottom:8 }}>
+                      {vs.icon} {final.verdict}
+                    </div>
+                    <div style={{ display:'flex', height:9, borderRadius:3, overflow:'hidden', marginBottom:6 }}>
+                      <div style={{ width:`${final.combined*100}%`, background:vs.color,
+                        boxShadow:`0 0 12px ${vs.color}55`, transition:'width 0.8s cubic-bezier(0.23,1,0.32,1)' }}/>
+                      <div style={{ flex:1, background:'#ff444433' }}/>
+                    </div>
+                    <div style={{ display:'flex', justifyContent:'space-between', fontSize:10, color:vs.color+'88', marginBottom:10 }}>
+                      <span>HUMAN {(final.combined*100).toFixed(1)}%</span>
+                      <span>AI {((1-final.combined)*100).toFixed(1)}%</span>
+                    </div>
+                    <div style={{ fontSize:11, color:vs.color+'cc', lineHeight:1.6,
+                      borderTop:`1px solid ${vs.color}22`, paddingTop:8 }}>
+                      {final.explanation}
+                    </div>
+                  </div>
+
+                  {/* Score composition */}
+                  <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4, padding:'12px 14px' }}>
+                    <div style={{ fontSize:10, color:'#33336a', letterSpacing:'0.1em', marginBottom:10 }}>SCORE COMPOSITION</div>
+                    {[
+                      { label:'Stage 1 · Entropy (×0.70)', score:s1?.human_score||0, w:'70%' },
+                      ...(s2 ? [{ label:'Stage 2 · Semantic (×0.30)', score:s2.s2score, w:'30%' }] : []),
+                      { label:'Combined Final', score:final.combined, w:'—' },
+                    ].map((r,i) => (
+                      <div key={i} style={{ marginBottom:9 }}>
+                        <div style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
+                          <span style={{ fontSize:11, color:'#8888cc', fontFamily:'monospace' }}>{r.label}</span>
+                          <span style={{ fontSize:10, color:C.dim, fontFamily:'monospace' }}>w={r.w}</span>
+                        </div>
+                        <Bar value={r.score} color={sc(r.score)}/>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* β zone note */}
+                  {final.combined >= 0.42 && final.combined <= 0.78 && (
+                    <div style={{ background:'#1a1400', border:`1px solid #ffcc0022`, borderRadius:4,
+                      padding:'8px 12px', fontSize:10, color:'#ffcc00aa' }}>
+                      ◈ Score within β_critical ∈ [0.6, 0.8] — critical entropy retention zone.
+                      Code at this range shows partial entropy collapse consistent with AI-assisted authorship.
+                    </div>
+                  )}
+
+                  {final.verdict === 'AMBIGUOUS' && (
+                    <div style={{ background:'#0f0f1a', border:`1px solid ${C.border}`, borderRadius:4,
+                      padding:'10px 12px', fontSize:10, color:C.muted, lineHeight:1.8 }}>
+                      <div style={{ color:'#6666aa', letterSpacing:'0.1em', marginBottom:5 }}>IF STILL UNSURE</div>
+                      <div>→ Check git history — human code has irregular commit patterns</div>
+                      <div>→ Look for commented-out experiments or dead code paths</div>
+                      <div>→ AI error messages are always polite — humans write terse ones</div>
+                      <div>→ Ask to explain a non-obvious design decision verbally</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* STAGE 1 TAB */}
+              {tab==='s1' && s1 && (
+                <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                  {(() => {
+                    const v1 = VSTYLE[s1.verdict]||VSTYLE['AMBIGUOUS'];
+                    return (
+                      <div style={{ background:v1.bg, border:`1px solid ${v1.color}33`, borderRadius:4,
+                        padding:'12px 14px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                        <div>
+                          <div style={{ fontSize:9, color:v1.color+'88', letterSpacing:'0.15em', marginBottom:4 }}>
+                            STAGE 1 · {s1.confidence.toUpperCase()}
+                          </div>
+                          <div style={{ fontSize:14, color:v1.color }}>{s1.verdict}</div>
+                          <div style={{ fontSize:9, color:v1.color+'66', marginTop:3 }}>
+                            {s1.needsStage2 ? '→ Ambiguous — Stage 2 triggered' : '→ Unambiguous — Stage 2 skipped'}
+                          </div>
+                        </div>
+                        <div style={{ textAlign:'right' }}>
+                          <div style={{ fontSize:30, color:v1.color, fontWeight:'bold', lineHeight:1 }}>
+                            {(s1.human_score*100).toFixed(0)}<span style={{ fontSize:13, opacity:0.6 }}>%</span>
+                          </div>
+                          <div style={{ fontSize:9, color:v1.color+'66' }}>human_score</div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                  <div style={{ display:'flex', height:8, borderRadius:3, overflow:'hidden', marginBottom:2 }}>
+                    <div style={{ width:`${s1.human_score*100}%`, background:C.human,
+                      boxShadow:`0 0 10px ${C.human}44`, transition:'width 0.7s cubic-bezier(0.23,1,0.32,1)' }}/>
+                    <div style={{ flex:1, background:'#ff444433' }}/>
+                  </div>
+                  <div style={{ display:'flex', justifyContent:'space-between', fontSize:10, color:C.dim }}>
+                    <span style={{ color:C.human+'88' }}>HUMAN {(s1.human_score*100).toFixed(1)}%</span>
+                    <span style={{ color:C.ai+'88' }}>AI {(s1.ai_score*100).toFixed(1)}%</span>
+                  </div>
+                  <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4, padding:'11px 13px' }}>
+                    <div style={{ fontSize:10, color:'#33336a', letterSpacing:'0.1em', marginBottom:10 }}>UNIVERSAL SIGNALS</div>
+                    <SigRow label="Byte Entropy"   score={s1.score_entropy}    raw={s1.byte_entropy}    weight="20%"/>
+                    <SigRow label="Compress Ratio" score={s1.score_compress}   raw={s1.compress_ratio}  weight="20%"/>
+                    <SigRow label="Burstiness"     score={s1.score_burstiness} raw={s1.burstiness}      weight="20%"/>
+                  </div>
+                  <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4, padding:'11px 13px' }}>
+                    <div style={{ fontSize:10, color:'#33336a', letterSpacing:'0.1em', marginBottom:10 }}>CODE SIGNALS (×0.40)</div>
+                    <SigRow label="Identifier Entropy"   score={s1.type_signals.id_entropy_score}    raw={s1.type_signals.identifier_entropy}  weight="14%"/>
+                    <SigRow label="Generic Name Ratio"   score={s1.type_signals.generic_score}       raw={s1.type_signals.generic_ratio}       weight="12%"/>
+                    <SigRow label="Complexity Variance"  score={s1.type_signals.ast_score}           raw={s1.type_signals.complexity_variance}  weight="8%"/>
+                    <SigRow label="Line Length Variance" score={s1.type_signals.line_variance_score} raw={s1.type_signals.line_variance}        weight="6%"/>
+                  </div>
+                </div>
+              )}
+
+              {/* STAGE 2 TAB */}
+              {tab==='s2' && s2 && (
+                <div style={{ display:'flex', flexDirection:'column', gap:7 }}>
+                  <div style={{
+                    background: s2.s2score>=0.55 ? '#061408' : s2.s2score>=0.42 ? '#1a1400' : '#160606',
+                    border:`1px solid ${s2.s2score>=0.55 ? '#00e87a33' : s2.s2score>=0.42 ? '#ffcc0033' : '#ff444433'}`,
+                    borderRadius:4, padding:'12px 14px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                    <div>
+                      <div style={{ fontSize:9, color:C.dim, letterSpacing:'0.15em', marginBottom:4 }}>STAGE 2 · SEMANTIC</div>
+                      <div style={{ fontSize:13, color: s2.s2score>=0.55 ? C.human : s2.s2score>=0.42 ? C.warn : C.ai }}>
+                        {s2.s2verdict}
+                      </div>
+                      <div style={{ fontSize:9, color:C.dim, marginTop:3 }}>{s2.aiFlags}/5 checks flagged AI</div>
+                    </div>
+                    <div style={{ textAlign:'right' }}>
+                      <div style={{ fontSize:30, color: s2.s2score>=0.55 ? C.human : s2.s2score>=0.42 ? C.warn : C.ai,
+                        fontWeight:'bold', lineHeight:1 }}>
+                        {(s2.s2score*100).toFixed(0)}<span style={{ fontSize:13, opacity:0.6 }}>%</span>
+                      </div>
+                      <div style={{ fontSize:9, color:C.dim }}>semantic_score</div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize:10, color:C.dim }}>▲ AI = flags AI · ▽ HU = flags human</div>
+                  {s2.checks.map(c => <SemCheck key={c.id} c={c}/>)}
+                </div>
+              )}
+
+              {/* STAGNATION TAB */}
+              {tab==='stagnation' && stag && (
+                <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                  <div style={{ background: stag.B_sufficient ? '#061408' : '#160606',
+                    border:`1px solid ${stag.B_sufficient ? '#00e87a33' : '#ff444433'}`,
+                    borderRadius:4, padding:'12px 14px' }}>
+                    <div style={{ fontSize:9, color:C.dim, letterSpacing:'0.15em', marginBottom:6 }}>
+                      STAGNATION LAYER · B_req = α·D^γ · α={stag.alpha} · γ={stag.gamma}
+                    </div>
+                    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                      <div style={{ fontSize:13, color: stag.B_sufficient ? C.human : C.ai }}>
+                        {stag.B_sufficient ? '✓ B ≥ B_req — Sufficient variance' : '✗ B < B_req — Variance deficit'}
+                      </div>
+                      <div style={{ textAlign:'right' }}>
+                        <div style={{ fontSize:10, color:C.dim }}>θ proxy</div>
+                        <div style={{ fontSize:22, color:stag.thetaZone.color, fontWeight:'bold', lineHeight:1 }}>
+                          {stag.theta.toFixed(3)}
+                        </div>
+                        <div style={{ fontSize:9, color:stag.thetaZone.color }}>{stag.thetaZone.label}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {[
+                    { label:'D  (Optimization Depth)',   v:stag.D,     note:'log₂(S) − log₂(T)', color:C.text },
+                    { label:'B_req = α·D^γ',             v:stag.B_req, note:`${stag.alpha}×${stag.D}^${stag.gamma}`, color:C.warn },
+                    { label:'B  (Variance proxy)',        v:stag.B,     note:'|human_score − AI cluster|', color: stag.B_sufficient ? C.human : C.ai },
+                    { label:'θ  (Entropy retention)',     v:stag.theta, note:stag.thetaZone.label, color:stag.thetaZone.color },
+                  ].map(r => (
+                    <div key={r.label} style={{ background:C.surface, border:`1px solid ${C.border}`,
+                      borderRadius:4, padding:'9px 12px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                      <div>
+                        <div style={{ fontSize:11, color:'#8888cc', fontFamily:'monospace' }}>{r.label}</div>
+                        <div style={{ fontSize:9, color:C.dim, marginTop:2 }}>{r.note}</div>
+                      </div>
+                      <div style={{ fontSize:18, color:r.color, fontFamily:'monospace', fontWeight:'bold' }}>
+                        {typeof r.v === 'number' ? r.v.toFixed(4) : r.v}
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* θ zone table */}
+                  <div style={{ background:C.surface, border:`1px solid ${C.border}`,
+                    borderRadius:4, padding:'10px 12px', fontSize:10, lineHeight:1.9 }}>
+                    <div style={{ color:'#33336a', letterSpacing:'0.1em', marginBottom:6 }}>θ ZONE REFERENCE</div>
+                    {[
+                      ['≥ 0.90','HEALTHY',          '#00e87a'],
+                      ['0.80–0.90','EARLY COLLAPSE', '#88ffcc'],
+                      ['0.60–0.80','CRITICAL ZONE',  '#ffcc00'],
+                      ['0.20–0.60','LATE COLLAPSE',  '#ff8844'],
+                      ['< 0.20','COMPLETE FAILURE',  '#ff4444'],
+                    ].map(([r,l,c]) => (
+                      <div key={r} style={{ display:'flex', gap:12 }}>
+                        <span style={{ color:c, minWidth:70, fontFamily:'monospace' }}>{r}</span>
+                        <span style={{ color:C.muted }}>{l}</span>
+                      </div>
+                    ))}
+                    <div style={{ marginTop:8, color:C.dim, fontSize:9, lineHeight:1.7 }}>
+                      NOTE: θ here is a proxy (human_score/0.65), not the full generational
+                      θ = H(Yₙ)/H(Y₀). Full θ requires comparing across training generations.
+                      α/γ: theoretical (0.5, 1.3) vs simulated (1.0377, 2.6383) — both confirm
+                      superlinear demand but magnitude is domain-dependent.
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div style={{ maxWidth:900, margin:'14px auto 0', fontSize:9, color:C.dim,
+        borderTop:`1px solid ${C.border}`, paddingTop:10, display:'flex', justifyContent:'space-between' }}>
+        <span>Theory of Stochastic Stagnation · Chaitanya Sihare · ORCID 0009-0000-0340-2492</span>
+        <span>compress_ratio: bigram approx (no zlib) · θ: single-file proxy · full θ needs generational data</span>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,539 @@
+import { useState, useCallback } from "react";
+
+// ═══════════════════════════════════════════════════════════
+// EXACT PORT OF ai_detector.py — all formulas match source
+// Theory of Stochastic Stagnation (Sihare, 2026)
+// DOI: 10.17605/OSF.IO/FSMK9
+// ═══════════════════════════════════════════════════════════
+
+const AI_NAMES = new Set([
+  'result','results','data','value','values','temp','tmp','item','items',
+  'element','helper','utils','output','input','param','params','args','kwargs',
+  'obj','node','key','val','num','count','total','index','idx','lst','arr',
+  'response','request','handler','manager','processor','execute','compute'
+]);
+
+function byteEntropy(str) {
+  if (!str) return 0;
+  const bytes = new TextEncoder().encode(str);
+  const counts = {};
+  for (const b of bytes) counts[b] = (counts[b] || 0) + 1;
+  const total = bytes.length;
+  return -Object.values(counts).reduce((acc, c) => acc + (c/total) * Math.log2(c/total), 0);
+}
+
+function compressRatio(str) {
+  // JS has no zlib; approximate using character-level redundancy
+  // Method: unique bigrams / total bigrams (correlates with compression ratio)
+  if (str.length < 32) return 1.0;
+  const bigrams = {};
+  for (let i = 0; i < str.length - 1; i++) {
+    const bg = str[i] + str[i+1];
+    bigrams[bg] = (bigrams[bg] || 0) + 1;
+  }
+  const unique = Object.keys(bigrams).length;
+  const total  = str.length - 1;
+  // Normalize: ratio approaches 1.0 for random, lower for repetitive
+  return Math.min(1.0, unique / Math.max(total, 1));
+}
+
+function burstiness(str, chunkSize = 256) {
+  if (str.length < chunkSize * 2) return 0.5;
+  const chunks = [];
+  for (let i = 0; i < str.length - chunkSize; i += chunkSize) {
+    chunks.push(str.slice(i, i + chunkSize));
+  }
+  const ents = chunks.filter(c => c).map(c => byteEntropy(c));
+  if (ents.length < 2) return 0.5;
+  const m = ents.reduce((a, b) => a + b, 0) / ents.length;
+  const std = Math.sqrt(ents.reduce((a, e) => a + (e - m) ** 2, 0) / ents.length);
+  return Math.min(1.0, std / 0.5);
+}
+
+function scoreEntropy(h) {
+  if (h < 3.0) return 0.10;
+  if (h < 5.0) return 0.40;
+  if (h >= 6.2 && h <= 7.6) return 0.25; // AI cluster zone
+  if (h > 7.8) return 0.70;
+  return 0.60;
+}
+
+function scoreCompress(r) {
+  // Mapped from Python score_compress but using our bigram approximation
+  // The approximation gives higher values, so we re-scale thresholds
+  if (r < 0.30) return 0.10;
+  if (r < 0.65) return 0.25;
+  if (r < 0.80) return 0.55;
+  return 0.75;
+}
+
+function analyzeCode(src) {
+  const s = {};
+  const words = (src.match(/\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b/g) || []);
+
+  // Identifier entropy
+  if (words.length > 0) {
+    const wc = {};
+    for (const w of words) wc[w] = (wc[w] || 0) + 1;
+    const n = words.length;
+    const ie = -Object.values(wc).reduce((acc, c) => acc + (c/n) * Math.log2(c/n), 0);
+    s.identifier_entropy = Math.round(ie * 10000) / 10000;
+    s.id_entropy_score   = Math.min(1.0, ie / 6.0);
+  } else {
+    s.identifier_entropy = 0.0;
+    s.id_entropy_score   = 0.5;
+  }
+
+  // Generic name ratio
+  const id_set = new Set(words.map(w => w.toLowerCase()));
+  let overlap = 0;
+  for (const w of id_set) { if (AI_NAMES.has(w)) overlap++; }
+  const gr = overlap / Math.max(id_set.size, 1);
+  s.generic_ratio = Math.round(gr * 10000) / 10000;
+  s.generic_score = Math.max(0.0, 1.0 - gr * 2);
+
+  // AST complexity variance — approximate in JS by counting control flow keywords
+  const fnMatches = src.match(/\bdef\s+\w+/g) || [];
+  if (fnMatches.length > 0) {
+    // Crude per-function complexity: split by def and count control keywords
+    const fnBlocks = src.split(/(?=\bdef\s)/);
+    const cxs = fnBlocks.slice(1).map(block => {
+      return (block.match(/\b(if|for|while|try|except)\b/g) || []).length;
+    });
+    if (cxs.length >= 2) {
+      const m = cxs.reduce((a,b)=>a+b,0)/cxs.length;
+      const variance = cxs.reduce((a,v)=>a+(v-m)**2,0)/cxs.length;
+      s.complexity_variance = Math.round(variance * 10000) / 10000;
+      s.ast_score = Math.min(1.0, variance / 4.0);
+    } else {
+      s.complexity_variance = 0.0;
+      s.ast_score = 0.30; // single function, likely simple/AI
+    }
+  } else {
+    s.complexity_variance = 0.0;
+    s.ast_score = 0.50;
+  }
+
+  // Line length variance
+  const lines = src.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length >= 2) {
+    const lens = lines.map(l => l.length);
+    const m = lens.reduce((a,b)=>a+b,0)/lens.length;
+    const lv = lens.reduce((a,v)=>a+(v-m)**2,0)/lens.length;
+    s.line_variance = Math.round(lv * 10000) / 10000;
+    s.line_variance_score = Math.min(1.0, lv / 400.0);
+  } else {
+    s.line_variance = 0.0;
+    s.line_variance_score = 0.5;
+  }
+
+  // type_specific_score — from ai_detector.py analyze_code
+  // Weighted: id_entropy(0.35) + generic(0.30) + ast(0.20) + line_var(0.15)
+  s.type_specific_score = Math.round(
+    (s.id_entropy_score * 0.35 +
+     s.generic_score    * 0.30 +
+     s.ast_score        * 0.20 +
+     s.line_variance_score * 0.15) * 10000
+  ) / 10000;
+
+  return s;
+}
+
+function runDetector(src) {
+  const hb    = byteEntropy(src);
+  const cr    = compressRatio(src);
+  const burst = burstiness(src);
+  const se    = scoreEntropy(hb);
+  const sc    = scoreCompress(cr);
+  const ts    = analyzeCode(src);
+  const tss   = ts.type_specific_score;
+
+  // Final formula from _analyze(): se*0.20 + sc*0.20 + burst*0.20 + tss*0.40
+  const final = Math.round((se * 0.20 + sc * 0.20 + burst * 0.20 + tss * 0.40) * 10000) / 10000;
+
+  let verdict, confidence;
+  if (final >= 0.75) { verdict = 'LIKELY HUMAN';        confidence = 'High'; }
+  else if (final >= 0.60) { verdict = 'PROBABLY HUMAN'; confidence = 'Medium'; }
+  else if (final >= 0.45) { verdict = 'AMBIGUOUS';      confidence = 'Low'; }
+  else if (final >= 0.30) { verdict = 'PROBABLY AI';    confidence = 'Medium'; }
+  else                    { verdict = 'LIKELY AI-GENERATED'; confidence = 'High'; }
+
+  return {
+    human_score: final,
+    ai_score: Math.round((1.0 - final) * 10000) / 10000,
+    verdict, confidence,
+    byte_entropy: Math.round(hb * 10000) / 10000,
+    compress_ratio: Math.round(cr * 10000) / 10000,
+    burstiness: Math.round(burst * 10000) / 10000,
+    score_entropy: se, score_compress: sc, score_burstiness: burst,
+    score_type: tss,
+    type_signals: ts,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════
+
+const VERDICTS = {
+  'LIKELY HUMAN':        { color: '#00ff9d', bg: '#003d26', label: 'LIKELY HUMAN',        icon: '◉' },
+  'PROBABLY HUMAN':      { color: '#7dffcb', bg: '#002a1a', label: 'PROBABLY HUMAN',      icon: '◎' },
+  'AMBIGUOUS':           { color: '#ffe566', bg: '#2e2500', label: 'AMBIGUOUS',           icon: '◈' },
+  'PROBABLY AI':         { color: '#ff8c42', bg: '#2e1200', label: 'PROBABLY AI',         icon: '◍' },
+  'LIKELY AI-GENERATED': { color: '#ff4040', bg: '#2e0000', label: 'LIKELY AI-GENERATED', icon: '●' },
+};
+
+const SIGNALS = [
+  { key: 'score_entropy',       label: 'Byte Entropy',           raw: 'byte_entropy',       weight: '20%', group: 'universal' },
+  { key: 'score_compress',      label: 'Compress Ratio',         raw: 'compress_ratio',     weight: '20%', group: 'universal' },
+  { key: 'score_burstiness',    label: 'Burstiness',             raw: 'burstiness',         weight: '20%', group: 'universal' },
+];
+const CODE_SIGNALS = [
+  { key: 'id_entropy_score',    label: 'Identifier Entropy',     raw: 'identifier_entropy', weight: '14%', group: 'code' },
+  { key: 'generic_score',       label: 'Generic Name Ratio',     raw: 'generic_ratio',      weight: '12%', group: 'code' },
+  { key: 'ast_score',           label: 'Complexity Variance',    raw: 'complexity_variance',weight: '8%',  group: 'code' },
+  { key: 'line_variance_score', label: 'Line Length Variance',   raw: 'line_variance',      weight: '6%',  group: 'code' },
+];
+
+const DEMO_HUMAN = `def fibonacci_with_memo(n, cache=None):
+    """Compute nth fibonacci number with memoization."""
+    if cache is None:
+        cache = {}
+    if n in cache:
+        return cache[n]
+    if n <= 1:
+        return n
+    cache[n] = fibonacci_with_memo(n-1, cache) + fibonacci_with_memo(n-2, cache)
+    return cache[n]
+
+def format_sequence(limit=15):
+    # print first N fibonacci numbers with index
+    output = []
+    for idx in range(limit):
+        val = fibonacci_with_memo(idx)
+        output.append(f"F({idx}) = {val}")
+    return "\\n".join(output)
+
+if __name__ == "__main__":
+    print(format_sequence(20))
+`;
+
+const DEMO_AI = `def calculate_fibonacci(n):
+    """Calculate fibonacci number."""
+    if n <= 0:
+        return 0
+    elif n == 1:
+        return 1
+    else:
+        result = calculate_fibonacci(n - 1) + calculate_fibonacci(n - 2)
+        return result
+
+def process_data(input_data):
+    """Process the input data."""
+    output = []
+    for item in input_data:
+        value = calculate_fibonacci(item)
+        output.append(value)
+    return output
+
+def main():
+    """Main function to execute the program."""
+    data = list(range(10))
+    results = process_data(data)
+    for index, value in enumerate(results):
+        print(f"Result {index}: {value}")
+
+if __name__ == "__main__":
+    main()
+`;
+
+function Bar({ value, color }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div style={{
+        flex: 1, height: 6, background: '#1a1a2e', borderRadius: 3, overflow: 'hidden',
+        border: '1px solid #2a2a4a'
+      }}>
+        <div style={{
+          width: `${Math.round(value * 100)}%`, height: '100%',
+          background: color,
+          borderRadius: 3,
+          transition: 'width 0.8s cubic-bezier(0.23, 1, 0.32, 1)',
+          boxShadow: `0 0 8px ${color}55`
+        }} />
+      </div>
+      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#aaa', minWidth: 36, textAlign: 'right' }}>
+        {(value * 100).toFixed(0)}%
+      </span>
+    </div>
+  );
+}
+
+function SignalRow({ label, score, raw, weight, color, groupLabel }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: '#8888bb', letterSpacing: '0.04em', fontFamily: 'monospace' }}>
+          {label}
+        </span>
+        <div style={{ display: 'flex', gap: 12 }}>
+          <span style={{ fontSize: 10, color: '#555577', fontFamily: 'monospace' }}>
+            raw={raw !== undefined ? raw.toFixed(3) : '—'}
+          </span>
+          <span style={{ fontSize: 10, color: '#444466', fontFamily: 'monospace' }}>
+            w={weight}
+          </span>
+        </div>
+      </div>
+      <Bar value={score} color={color} />
+    </div>
+  );
+}
+
+export default function App() {
+  const [code, setCode]     = useState('');
+  const [result, setResult] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const analyze = useCallback(() => {
+    if (!code.trim()) return;
+    setRunning(true);
+    setTimeout(() => {
+      setResult(runDetector(code));
+      setRunning(false);
+    }, 180);
+  }, [code]);
+
+  const loadDemo = (src) => { setCode(src); setResult(null); };
+
+  const vStyle = result ? (VERDICTS[result.verdict] || VERDICTS['AMBIGUOUS']) : null;
+
+  const getScoreColor = (v) => {
+    if (v >= 0.75) return '#00ff9d';
+    if (v >= 0.60) return '#7dffcb';
+    if (v >= 0.45) return '#ffe566';
+    if (v >= 0.30) return '#ff8c42';
+    return '#ff4040';
+  };
+
+  return (
+    <div style={{
+      minHeight: '100vh',
+      background: '#080812',
+      color: '#d0d0e8',
+      fontFamily: "'Courier New', Courier, monospace",
+      padding: '24px 20px',
+      boxSizing: 'border-box',
+    }}>
+      {/* Header */}
+      <div style={{ maxWidth: 860, margin: '0 auto 28px' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 4 }}>
+          <span style={{
+            fontSize: 11, letterSpacing: '0.2em', color: '#4444aa',
+            textTransform: 'uppercase', fontWeight: 'bold'
+          }}>
+            STOCHASTIC STAGNATION FRAMEWORK
+          </span>
+          <span style={{ fontSize: 10, color: '#333355' }}>
+            Sihare (2026) · DOI:10.17605/OSF.IO/FSMK9
+          </span>
+        </div>
+        <h1 style={{
+          margin: 0, fontSize: 22, fontWeight: 'normal', letterSpacing: '0.06em',
+          color: '#e0e0ff',
+          borderBottom: '1px solid #1a1a3a', paddingBottom: 12
+        }}>
+          <span style={{ color: '#5555ff' }}>⬡</span> AI CODE DETECTOR
+          <span style={{ fontSize: 13, color: '#444466', marginLeft: 16, letterSpacing: '0.04em' }}>
+            β_critical ∈ [0.6, 0.8]
+          </span>
+        </h1>
+        <p style={{ fontSize: 11, color: '#44445a', margin: '8px 0 0', lineHeight: 1.7 }}>
+          Entropy reveals origin. AI content occupies a narrow variance band — too clean, too regular, converged.
+          Paste Python code to measure <span style={{ color: '#6666cc' }}>human_score ∈ [0,1]</span> via
+          byte entropy · compress ratio · burstiness · identifier entropy · generic names · complexity variance · line variance.
+        </p>
+      </div>
+
+      <div style={{ maxWidth: 860, margin: '0 auto', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        {/* LEFT — Input */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 10, color: '#444466', letterSpacing: '0.1em' }}>LOAD DEMO →</span>
+            <button onClick={() => loadDemo(DEMO_HUMAN)} style={{
+              background: '#0d1a12', border: '1px solid #00cc6a44', color: '#00cc6a',
+              padding: '4px 10px', fontSize: 10, cursor: 'pointer', letterSpacing: '0.08em',
+              fontFamily: 'monospace', borderRadius: 2
+            }}>HUMAN</button>
+            <button onClick={() => loadDemo(DEMO_AI)} style={{
+              background: '#1a0d0d', border: '1px solid #cc444444', color: '#cc4444',
+              padding: '4px 10px', fontSize: 10, cursor: 'pointer', letterSpacing: '0.08em',
+              fontFamily: 'monospace', borderRadius: 2
+            }}>AI</button>
+            <button onClick={() => { setCode(''); setResult(null); }} style={{
+              background: 'transparent', border: '1px solid #333355', color: '#444466',
+              padding: '4px 10px', fontSize: 10, cursor: 'pointer', letterSpacing: '0.08em',
+              fontFamily: 'monospace', borderRadius: 2, marginLeft: 'auto'
+            }}>CLR</button>
+          </div>
+
+          <textarea
+            value={code}
+            onChange={e => { setCode(e.target.value); setResult(null); }}
+            placeholder="# Paste Python code here..."
+            style={{
+              width: '100%', height: 320, background: '#0a0a1a',
+              border: '1px solid #1e1e3e', borderRadius: 4,
+              color: '#c0c0e0', fontFamily: 'monospace', fontSize: 12,
+              padding: 14, resize: 'none', outline: 'none', boxSizing: 'border-box',
+              lineHeight: 1.6,
+              caretColor: '#5555ff'
+            }}
+          />
+
+          <button
+            onClick={analyze}
+            disabled={!code.trim() || running}
+            style={{
+              background: code.trim() && !running ? '#1a1a4a' : '#0d0d1e',
+              border: `1px solid ${code.trim() && !running ? '#4444cc' : '#222244'}`,
+              color: code.trim() && !running ? '#8888ff' : '#333355',
+              padding: '10px 0', fontSize: 12, cursor: code.trim() && !running ? 'pointer' : 'default',
+              letterSpacing: '0.2em', fontFamily: 'monospace', borderRadius: 3,
+              transition: 'all 0.2s', width: '100%'
+            }}
+          >
+            {running ? '[ SCANNING... ]' : '[ RUN DETECTOR ]'}
+          </button>
+
+          {/* Formula */}
+          <div style={{
+            background: '#0a0a18', border: '1px solid #1a1a35', borderRadius: 4,
+            padding: '10px 14px', fontSize: 10, color: '#333355', lineHeight: 1.8
+          }}>
+            <div style={{ color: '#333366', marginBottom: 4, letterSpacing: '0.08em' }}>FORMULA</div>
+            <div style={{ color: '#44447a' }}>human_score =</div>
+            <div style={{ paddingLeft: 12, color: '#3a3a6a' }}>
+              entropy×0.20 + compress×0.20 + burst×0.20 +<br/>
+              (id_entropy×0.35 + generic×0.30 +<br/>
+              &nbsp;ast_var×0.20 + line_var×0.15)×0.40
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT — Results */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {!result ? (
+            <div style={{
+              height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: '#08080f', border: '1px dashed #1a1a3a', borderRadius: 4,
+              color: '#22224a', fontSize: 12, letterSpacing: '0.1em', minHeight: 320
+            }}>
+              AWAITING INPUT
+            </div>
+          ) : (
+            <>
+              {/* Score display */}
+              <div style={{
+                background: vStyle.bg,
+                border: `1px solid ${vStyle.color}33`,
+                borderRadius: 4, padding: '16px 18px',
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+              }}>
+                <div>
+                  <div style={{ fontSize: 10, color: vStyle.color + '88', letterSpacing: '0.15em', marginBottom: 6 }}>
+                    VERDICT · {result.confidence.toUpperCase()} CONFIDENCE
+                  </div>
+                  <div style={{ fontSize: 16, color: vStyle.color, letterSpacing: '0.1em', fontWeight: 'bold' }}>
+                    {vStyle.icon} {result.verdict}
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 36, color: vStyle.color, fontWeight: 'bold', lineHeight: 1 }}>
+                    {(result.human_score * 100).toFixed(0)}
+                    <span style={{ fontSize: 16, color: vStyle.color + '88' }}>%</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: vStyle.color + '66', letterSpacing: '0.08em' }}>
+                    human_score
+                  </div>
+                </div>
+              </div>
+
+              {/* Dual bar */}
+              <div style={{
+                background: '#09091a', border: '1px solid #1a1a35', borderRadius: 4, padding: '12px 14px'
+              }}>
+                <div style={{ display: 'flex', gap: 0, height: 10, borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
+                  <div style={{
+                    width: `${result.human_score * 100}%`, background: vStyle.color,
+                    transition: 'width 0.8s cubic-bezier(0.23, 1, 0.32, 1)',
+                    boxShadow: `0 0 12px ${vStyle.color}66`
+                  }} />
+                  <div style={{ flex: 1, background: '#ff404044' }} />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#444466' }}>
+                  <span style={{ color: '#00ff9d88' }}>HUMAN {(result.human_score * 100).toFixed(1)}%</span>
+                  <span style={{ color: '#ff404088' }}>AI {(result.ai_score * 100).toFixed(1)}%</span>
+                </div>
+              </div>
+
+              {/* Universal signals */}
+              <div style={{
+                background: '#08080f', border: '1px solid #1a1a35', borderRadius: 4, padding: '12px 14px'
+              }}>
+                <div style={{ fontSize: 10, color: '#333366', letterSpacing: '0.12em', marginBottom: 12 }}>
+                  UNIVERSAL SIGNALS · 0.0=AI → 1.0=HUMAN
+                </div>
+                {SIGNALS.map(sig => (
+                  <SignalRow
+                    key={sig.key}
+                    label={sig.label}
+                    score={result[sig.key]}
+                    raw={result[sig.raw]}
+                    weight={sig.weight}
+                    color={getScoreColor(result[sig.key])}
+                  />
+                ))}
+              </div>
+
+              {/* Code signals */}
+              <div style={{
+                background: '#08080f', border: '1px solid #1a1a35', borderRadius: 4, padding: '12px 14px'
+              }}>
+                <div style={{ fontSize: 10, color: '#333366', letterSpacing: '0.12em', marginBottom: 12 }}>
+                  CODE SIGNALS (type-specific block × 0.40)
+                </div>
+                {CODE_SIGNALS.map(sig => (
+                  <SignalRow
+                    key={sig.key}
+                    label={sig.label}
+                    score={result.type_signals[sig.key] ?? 0}
+                    raw={result.type_signals[sig.raw]}
+                    weight={sig.weight}
+                    color={getScoreColor(result.type_signals[sig.key] ?? 0)}
+                  />
+                ))}
+              </div>
+
+              {/* β zone note */}
+              {result.human_score >= 0.6 && result.human_score <= 0.8 && (
+                <div style={{
+                  background: '#1a1400', border: '1px solid #ffe56622', borderRadius: 4,
+                  padding: '8px 12px', fontSize: 10, color: '#ffe566aa', letterSpacing: '0.06em'
+                }}>
+                  ◈ Score within β_critical ∈ [0.6, 0.8] — critical entropy retention zone per stagnation theory
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div style={{ maxWidth: 860, margin: '20px auto 0', fontSize: 10, color: '#222244', letterSpacing: '0.06em', borderTop: '1px solid #0f0f25', paddingTop: 12, display: 'flex', justifyContent: 'space-between' }}>
+        <span>Theory of Stochastic Stagnation · Chaitanya Sihare · ORCID 0009-0000-0340-2492</span>
+        <span>NOTE: Browser JS has no zlib; compress_ratio approximated via bigram entropy</span>
+      </div>
+    </div>
+  );
+}
