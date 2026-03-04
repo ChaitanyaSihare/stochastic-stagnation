@@ -3,11 +3,11 @@
 
 > *"Intelligence oriented exclusively toward error minimization risks stochastic stagnation.
 > The future of intelligence is symbiotic."*
-> — Chaitanya Sihare, 2026
+> — Chaitanya
 
 **Paper:** [OSF DOI: 10.17605/OSF.IO/FSMK9](https://osf.io/fsmk9)
-**Author:** Chaitanya Sihare | ORCID: [0009-0000-0340-2492](https://orcid.org/0009-0000-0340-2492)
-**Affiliation:** PG College Seoni, Madhya Pradesh, India
+**Author:** Chaitanya  | ORCID: [0009-0000-0340-2492](https://orcid.org/0009-0000-0340-2492)
+
 
 ---
 
@@ -187,8 +187,7 @@ This is measurable. It is now measured.
 
 ## Contact
 
-Chaitanya Sihare
-PG College Seoni, Madhya Pradesh, India
+Chaitanya 
 ORCID: 0009-0000-0340-2492
 OSF: https://osf.io/fsmk9
 
