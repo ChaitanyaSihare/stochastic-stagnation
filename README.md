@@ -1,4 +1,4 @@
-# Theory of Stochastic Stagnation
+ my brother had this code written this i dont know python exactly.# Theory of Stochastic Stagnation
 **A framework for measuring entropy decay in AI-assisted systems**
 
 > *"Intelligence oriented exclusively toward error minimization risks stochastic stagnation.
